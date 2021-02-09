@@ -79,7 +79,7 @@ err_free:
 	return -1;
 }
 
-static int add_attr_to_device(struct iio_device *dev, xmlNode *n, enum iio_attr_type type)
+static int add_attr_to_device(struct iio_device *dev, int bidx, xmlNode *n, enum iio_attr_type type)
 {
 	xmlAttr *attr;
 	char *name = NULL;
@@ -104,7 +104,7 @@ static int add_attr_to_device(struct iio_device *dev, xmlNode *n, enum iio_attr_
 		case IIO_ATTR_TYPE_DEVICE:
 			return add_iio_dev_attr(&dev->attrs, name, " ", dev->id);
 		case IIO_ATTR_TYPE_BUFFER:
-			return add_iio_dev_attr(&dev->buffer_attrs, name, " buffer", dev->id);
+			return add_iio_dev_attr(&dev->buffer_attrs[bidx], name, " buffer", dev->id);
 		default:
 			return -1;
 	}
@@ -235,6 +235,73 @@ err_free_channel:
 	return NULL;
 }
 
+static int create_buffer_attrs(struct iio_device *dev, xmlNode *n)
+{
+	struct iio_dev_attrs *attrs;
+	unsigned int idx;
+	xmlAttr *attr;
+	int ret = -ENOENT;
+
+	for (attr = n->properties; attr; attr = attr->next) {
+		const char *content = (const char *) attr->children->content;
+		if (!strcmp((char *) attr->name, "index")) {
+			long long value;
+			char *end;
+			errno = 0;
+			value = strtoll(content, &end, 0);
+			if (end == content || value < 0 || errno == ERANGE)
+				return -ERANGE;
+			idx = (unsigned int) value;
+			ret = 0;
+		} else {
+			IIO_WARNING("Unknown field \'%s\' in device %s\n",
+				    attr->name, dev->id);
+		}
+	}
+
+	if (ret < 0) {
+		IIO_ERROR("No index property found for buffer\n");
+		return -1;
+	}
+
+	/* legacy buffer attributes were first */
+	if (idx == 0 && dev->nb_buffers == 1)
+		return 0;
+
+	if (idx >= dev->nb_buffers) {
+		attrs = realloc(dev->buffer_attrs, (idx + 1) * sizeof(*attrs));
+		if (!attrs)
+			return -ENOMEM;
+
+		dev->nb_buffers = idx + 1;
+		dev->buffer_attrs = attrs;
+	}
+
+	attrs = &dev->buffer_attrs[idx];
+	if (attrs->num > 0) {
+		/* old buffer-attributes beat us here */
+		if (idx == 0)
+			return 0;
+		IIO_ERROR("Duplicate buffer element found for '%s' buffer%u\n",
+			  dev->id, idx);
+		return -EFAULT;
+	}
+
+	for (n = n->children; n; n = n->next) {
+		if (!strcmp((char *) n->name, "attribute")) {
+			ret = add_attr_to_device(dev, idx, n, IIO_ATTR_TYPE_BUFFER);
+			if (ret < 0)
+				return ret;
+		} else {
+			IIO_WARNING("Unknown children \'%s\' in <buffer%u>\n",
+				    n->name, idx);
+			continue;
+		}
+	}
+
+	return 0;
+}
+
 static struct iio_device * create_device(struct iio_context *ctx, xmlNode *n)
 {
 	xmlAttr *attr;
@@ -280,14 +347,28 @@ static struct iio_device * create_device(struct iio_context *ctx, xmlNode *n)
 
 			chns[dev->nb_channels++] = chn;
 			dev->channels = chns;
+		} else if (!strcmp((char *) n->name, "buffer")) {
+			int ret = create_buffer_attrs(dev, n);
+
+			if (ret < 0)
+				goto err_free_device;
 		} else if (!strcmp((char *) n->name, "attribute")) {
-			if (add_attr_to_device(dev, n, IIO_ATTR_TYPE_DEVICE) < 0)
+			if (add_attr_to_device(dev, -1, n, IIO_ATTR_TYPE_DEVICE) < 0)
 				goto err_free_device;
 		} else if (!strcmp((char *) n->name, "debug-attribute")) {
-			if (add_attr_to_device(dev, n, IIO_ATTR_TYPE_DEBUG) < 0)
+			if (add_attr_to_device(dev, -1, n, IIO_ATTR_TYPE_DEBUG) < 0)
 				goto err_free_device;
 		} else if (!strcmp((char *) n->name, "buffer-attribute")) {
-			if (add_attr_to_device(dev, n, IIO_ATTR_TYPE_BUFFER) < 0)
+			/* initialized via new API, skip */
+			if (dev->nb_buffers > 0)
+				continue;
+			dev->buffer_attrs = calloc(1, sizeof(*dev->buffer_attrs));
+			if (!dev->buffer_attrs) {
+				errno = ENOMEM;
+				goto err_free_device;
+			}
+			dev->nb_buffers = 1;
+			if (add_attr_to_device(dev, 0, n, IIO_ATTR_TYPE_BUFFER) < 0)
 				goto err_free_device;
 		} else if (strcmp((char *) n->name, "text")) {
 			IIO_WARNING("Unknown children \'%s\' in <device>\n",
